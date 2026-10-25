@@ -12,6 +12,9 @@
 # The following values assume you have at least 32M ram
 
 [mysqld]
+# Benchmark experiment: reduce synchronous commit flushing.
+innodb_flush_log_at_trx_commit = 2
+sync_binlog = 0
 #
 # * Basic Settings
 #
