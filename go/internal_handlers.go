@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"math"
 	"net/http"
@@ -89,13 +90,9 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	for i, j := range assignMinCost(costs) {
 		ride := rides[i]
 		chairID := chairs[j].ID
-		result, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, ride.ID)
-		if err != nil {
+		if err := assignRide(ctx, ride.ID, ride.UserID, chairID); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
-		}
-		if n, err := result.RowsAffected(); err == nil && n == 1 {
-			notifyRide(ride.UserID, chairID)
 		}
 	}
 
@@ -165,4 +162,33 @@ func assignMinCost(costs [][]float64) []int {
 		}
 	}
 	return assigned
+}
+
+// assignRide changes the assignment and display availability atomically.
+// Candidate selection above still waits for all six chair notifications.
+func assignRide(ctx context.Context, rideID, userID, chairID string) error {
+	tx, err := db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, rideID)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE chairs SET incomplete_ride_count = incomplete_ride_count + 1, updated_at = updated_at WHERE id = ?", chairID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	notifyRide(userID, chairID)
+	return nil
 }
