@@ -2,53 +2,96 @@ package main
 
 import (
 	"database/sql"
-	"errors"
+	"math"
 	"net/http"
+	"sort"
 )
 
+type matchingChair struct {
+	ID        string        `db:"id"`
+	Speed     int           `db:"speed"`
+	Latitude  sql.NullInt64 `db:"latitude"`
+	Longitude sql.NullInt64 `db:"longitude"`
+}
+
 // このAPIをインスタンス内から一定間隔で叩かせることで、椅子とライドをマッチングさせる
+// 待っているライド × 空いている椅子を総当たりし、迎車にかかる時間（距離 ÷ 速さ）が短い組から順に確定する
 func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	// MEMO: 一旦最も待たせているリクエストに適当な空いている椅子マッチさせる実装とする。おそらくもっといい方法があるはず…
-	ride := &Ride{}
-	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+
+	rides := []Ride{}
+	if err := db.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at`); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	matched := &Chair{}
-	empty := false
-	for i := 0; i < 10; i++ {
-		if err := db.GetContext(ctx, matched, "SELECT * FROM chairs INNER JOIN (SELECT id FROM chairs WHERE is_active = TRUE ORDER BY RAND() LIMIT 1) AS tmp ON chairs.id = tmp.id LIMIT 1"); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			writeError(w, http.StatusInternalServerError, err)
-		}
-
-		if err := db.GetContext(ctx, &empty, "SELECT COUNT(*) = 0 FROM (SELECT COUNT(chair_sent_at) = 6 AS completed FROM ride_statuses WHERE ride_id IN (SELECT id FROM rides WHERE chair_id = ?) GROUP BY ride_id) is_completed WHERE completed = FALSE", matched.ID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if empty {
-			break
-		}
-	}
-	if !empty {
+	if len(rides) == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	if _, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", matched.ID, ride.ID); err != nil {
+	// 空いている椅子 = 割り当て済みのライドが、6 つの状態すべてを椅子に通知し終えている椅子
+	chairs := []matchingChair{}
+	if err := db.SelectContext(ctx, &chairs, `
+		SELECT c.id, m.speed, l.latitude, l.longitude
+		FROM chairs c
+		JOIN chair_models m ON m.name = c.model
+		LEFT JOIN chair_locations l ON l.id = (
+			SELECT id FROM chair_locations WHERE chair_id = c.id ORDER BY created_at DESC LIMIT 1
+		)
+		WHERE c.is_active = TRUE
+		  AND NOT EXISTS (
+			SELECT 1 FROM rides r
+			WHERE r.chair_id = c.id
+			  AND (SELECT COUNT(rs.chair_sent_at) FROM ride_statuses rs WHERE rs.ride_id = r.id) < 6
+		  )`); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	notifyRide(ride.UserID, matched.ID)
+	if len(chairs) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	type pair struct {
+		ride  int
+		chair int
+		cost  float64
+	}
+	pairs := make([]pair, 0, len(rides)*len(chairs))
+	for i, ride := range rides {
+		for j, chair := range chairs {
+			// 位置をまだ送っていない椅子は、ほかに空きがないときだけ使う
+			cost := math.Inf(1)
+			if chair.Latitude.Valid && chair.Longitude.Valid {
+				d := calculateDistance(int(chair.Latitude.Int64), int(chair.Longitude.Int64), ride.PickupLatitude, ride.PickupLongitude)
+				cost = float64(d) / float64(chair.Speed)
+			}
+			pairs = append(pairs, pair{ride: i, chair: j, cost: cost})
+		}
+	}
+	// コストが同じなら、待たせているライド（rides は created_at 順）を優先する
+	sort.SliceStable(pairs, func(a, b int) bool { return pairs[a].cost < pairs[b].cost })
+
+	rideUsed := make([]bool, len(rides))
+	chairUsed := make([]bool, len(chairs))
+	for _, p := range pairs {
+		if rideUsed[p.ride] || chairUsed[p.chair] {
+			continue
+		}
+		rideUsed[p.ride] = true
+		chairUsed[p.chair] = true
+
+		ride := rides[p.ride]
+		chairID := chairs[p.chair].ID
+		result, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, ride.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if n, err := result.RowsAffected(); err == nil && n == 1 {
+			notifyRide(ride.UserID, chairID)
+		}
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
