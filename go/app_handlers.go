@@ -528,7 +528,7 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE id = ?`, rideID); err != nil {
+	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE id = ? FOR UPDATE`, rideID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, errors.New("ride not found"))
 			return
@@ -619,6 +619,14 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+
+	// Keep the nearby-chairs availability in the same transaction as COMPLETED.
+	if ride.ChairID.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE chairs SET incomplete_ride_count = incomplete_ride_count - 1, updated_at = updated_at WHERE id = ?`, ride.ChairID.String); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -877,9 +885,7 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	// ライドごとに最新ステータスを引く代わりに COMPLETED 行の有無で完了を判定している。
-	// COMPLETED は ride_statuses の終端(appPostRideEvaluation でのみ INSERT され、
-	// 以降ステータスが積まれない)なので、最新ステータスを取り直す必要がない。
+	// 表示用の空車判定。再割り当て時の通知待ちはマッチング側で別に判定する。
 	rows := []nearbyChairRow{}
 	err = tx.SelectContext(
 		ctx,
@@ -890,12 +896,7 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 		   ON cl.id = (SELECT id FROM chair_locations
 		               WHERE chair_id = c.id ORDER BY created_at DESC LIMIT 1)
 		 WHERE c.is_active = TRUE
-		   AND NOT EXISTS (
-		     SELECT 1 FROM rides r
-		     WHERE r.chair_id = c.id
-		       AND NOT EXISTS (SELECT 1 FROM ride_statuses rs
-		                       WHERE rs.ride_id = r.id AND rs.status = 'COMPLETED')
-		   )
+		   AND c.incomplete_ride_count = 0
 		   AND ABS(cl.latitude - ?) + ABS(cl.longitude - ?) <= ?`,
 		coordinate.Latitude, coordinate.Longitude, distance,
 	)
