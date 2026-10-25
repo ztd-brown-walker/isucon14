@@ -31,7 +31,7 @@ user		= mysql
 #
 # Instead of skip-networking the default is now to listen only on
 # localhost which is more compatible and is not less secure.
-# isu2 / isu3 のアプリから接続するため、全インターフェースで待ち受ける
+# isu1 / isu3 のアプリから接続するため、全インターフェースで待ち受ける
 bind-address		= 0.0.0.0
 mysqlx-bind-address	= 127.0.0.1
 #
