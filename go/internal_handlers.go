@@ -4,8 +4,22 @@ import (
 	"database/sql"
 	"math"
 	"net/http"
-	"sort"
 )
+
+// 距離 1 を進むのにかかる実時間（秒）。2026-10-25 19:49 のベンチで、乗せてから目的地に着くまでの
+// 時間を乗車距離で割った実測値。速さ 3 は名目上 2 の 1.5 倍だが、実時間は 2 と変わらなかった
+var secondsPerDistance = map[int]float64{2: 0.066, 3: 0.066, 5: 0.045, 7: 0.032}
+
+// 実測のない速さは、速さ 2 の実測値から速さに反比例するとみなす
+func travelSecondsPerDistance(speed int) float64 {
+	if s, ok := secondsPerDistance[speed]; ok {
+		return s
+	}
+	return 0.132 / float64(speed)
+}
+
+// 位置をまだ送っていない椅子のコスト。ほかに空きがないときだけ使われるよう、どの組よりも大きくする
+const unknownLocationCost = 1e9
 
 type matchingChair struct {
 	ID        string        `db:"id"`
@@ -15,7 +29,8 @@ type matchingChair struct {
 }
 
 // このAPIをインスタンス内から一定間隔で叩かせることで、椅子とライドをマッチングさせる
-// 待っているライド × 空いている椅子を総当たりし、迎車にかかる時間（距離 ÷ 速さ）が短い組から順に確定する
+// 待っているライド × 空いている椅子について「迎車 + 移動」の実時間を見積もり、
+// 全体の合計が最小になる組み合わせをハンガリアン法で決める
 func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -52,37 +67,28 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type pair struct {
-		ride  int
-		chair int
-		cost  float64
+	// 椅子が足りないときは、待たせているライド（rides は created_at 順）から割り当てる
+	if len(rides) > len(chairs) {
+		rides = rides[:len(chairs)]
 	}
-	pairs := make([]pair, 0, len(rides)*len(chairs))
+
+	costs := make([][]float64, len(rides))
 	for i, ride := range rides {
+		trip := calculateDistance(ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
+		costs[i] = make([]float64, len(chairs))
 		for j, chair := range chairs {
-			// 位置をまだ送っていない椅子は、ほかに空きがないときだけ使う
-			cost := math.Inf(1)
-			if chair.Latitude.Valid && chair.Longitude.Valid {
-				d := calculateDistance(int(chair.Latitude.Int64), int(chair.Longitude.Int64), ride.PickupLatitude, ride.PickupLongitude)
-				cost = float64(d) / float64(chair.Speed)
+			if !chair.Latitude.Valid || !chair.Longitude.Valid {
+				costs[i][j] = unknownLocationCost
+				continue
 			}
-			pairs = append(pairs, pair{ride: i, chair: j, cost: cost})
+			pickup := calculateDistance(int(chair.Latitude.Int64), int(chair.Longitude.Int64), ride.PickupLatitude, ride.PickupLongitude)
+			costs[i][j] = float64(pickup+trip) * travelSecondsPerDistance(chair.Speed)
 		}
 	}
-	// コストが同じなら、待たせているライド（rides は created_at 順）を優先する
-	sort.SliceStable(pairs, func(a, b int) bool { return pairs[a].cost < pairs[b].cost })
 
-	rideUsed := make([]bool, len(rides))
-	chairUsed := make([]bool, len(chairs))
-	for _, p := range pairs {
-		if rideUsed[p.ride] || chairUsed[p.chair] {
-			continue
-		}
-		rideUsed[p.ride] = true
-		chairUsed[p.chair] = true
-
-		ride := rides[p.ride]
-		chairID := chairs[p.chair].ID
+	for i, j := range assignMinCost(costs) {
+		ride := rides[i]
+		chairID := chairs[j].ID
 		result, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, ride.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -94,4 +100,69 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// assignMinCost は行（ライド）ごとに列（椅子）を 1 つずつ、コストの合計が最小になるように割り当てる（ハンガリアン法）。
+// 行数は列数以下であること。戻り値の i 番目が行 i に割り当てた列。計算量は O(行数² × 列数)
+func assignMinCost(costs [][]float64) []int {
+	n := len(costs)
+	if n == 0 {
+		return nil
+	}
+	m := len(costs[0])
+	// 1 始まりで持ち、0 番目を番兵に使う
+	u := make([]float64, n+1)
+	v := make([]float64, m+1)
+	p := make([]int, m+1) // p[j]: 列 j に割り当てた行
+	way := make([]int, m+1)
+	for i := 1; i <= n; i++ {
+		p[0] = i
+		j0 := 0
+		minv := make([]float64, m+1)
+		used := make([]bool, m+1)
+		for j := range minv {
+			minv[j] = math.Inf(1)
+		}
+		for {
+			used[j0] = true
+			i0, delta, j1 := p[j0], math.Inf(1), 0
+			for j := 1; j <= m; j++ {
+				if used[j] {
+					continue
+				}
+				if cur := costs[i0-1][j-1] - u[i0] - v[j]; cur < minv[j] {
+					minv[j] = cur
+					way[j] = j0
+				}
+				if minv[j] < delta {
+					delta = minv[j]
+					j1 = j
+				}
+			}
+			for j := 0; j <= m; j++ {
+				if used[j] {
+					u[p[j]] += delta
+					v[j] -= delta
+				} else {
+					minv[j] -= delta
+				}
+			}
+			j0 = j1
+			if p[j0] == 0 {
+				break
+			}
+		}
+		for j0 != 0 {
+			j1 := way[j0]
+			p[j0] = p[j1]
+			j0 = j1
+		}
+	}
+	assigned := make([]int, n)
+	for j := 1; j <= m; j++ {
+		if p[j] != 0 {
+			assigned[p[j]-1] = j - 1
+		}
+	}
+	return assigned
 }
