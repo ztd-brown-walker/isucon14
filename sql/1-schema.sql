@@ -33,7 +33,8 @@ CREATE TABLE chairs
   created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
   updated_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新日時',
   PRIMARY KEY (id),
-  INDEX idx_chairs_owner_id (owner_id)
+  INDEX idx_chairs_owner_id (owner_id),
+  INDEX idx_chairs_access_token (access_token)
 )
   COMMENT = '椅子情報テーブル';
 
@@ -92,7 +93,9 @@ CREATE TABLE rides
   evaluation            INTEGER     NULL     COMMENT '評価',
   created_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '要求日時',
   updated_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '状態更新日時',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  INDEX idx_rides_chair_updated (chair_id, updated_at),
+  INDEX idx_rides_user_created (user_id, created_at)
 )
   COMMENT = 'ライド情報テーブル';
 
