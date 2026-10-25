@@ -431,6 +431,7 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	appNotifier.notify(user.ID)
 
 	writeJSON(w, http.StatusAccepted, &appPostRidesResponse{
 		RideID: rideID,
@@ -624,6 +625,7 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	notifyRide(ride.UserID, ride.ChairID.String)
 
 	writeJSON(w, http.StatusOK, &appPostRideEvaluationResponse{
 		CompletedAt: ride.UpdatedAt.UnixMilli(),
@@ -657,7 +659,10 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	serveNotificationSSE(ctx, w, func(force bool) (bool, error) {
+	wake, unsubscribe := appNotifier.subscribe(user.ID)
+	defer unsubscribe()
+
+	serveNotificationSSE(ctx, w, wake, func(force bool) (bool, error) {
 		return sendAppNotification(ctx, w, user, force)
 	})
 }
