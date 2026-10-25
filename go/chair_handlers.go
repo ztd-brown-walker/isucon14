@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -96,10 +97,6 @@ type chairPostCoordinateResponse struct {
 }
 
 func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
-	trace := newCoordinateTrace(w, r)
-	w = trace.response
-	defer trace.finish()
-	trace.stage("decode_request")
 	ctx := r.Context()
 	req := &Coordinate{}
 	if err := bindJSON(r, req); err != nil {
@@ -108,56 +105,38 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chair := ctx.Value("chair").(*Chair)
-	trace.fields["chair_id"] = chair.ID
 
-	trace.stage("begin_tx")
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
+	// トランザクションは張らない。下の SELECT はロックを取らないので、張っても競合は防げず、
+	// BEGIN から COMMIT まで接続を握り続けるだけになる。
 
-	trace.stage("insert_location")
-	chairLocationID := ulid.Make().String()
-	if _, err := tx.ExecContext(
+	// created_at をアプリで決めて、入れた行を読み直さずに recorded_at を返す。
+	// カラムは DATETIME(6) なので、マイクロ秒に揃えて DB に入る値と一致させる。
+	recordedAt := time.Now().Truncate(time.Microsecond)
+	if _, err := db.ExecContext(
 		ctx,
-		`INSERT INTO chair_locations (id, chair_id, latitude, longitude) VALUES (?, ?, ?, ?)`,
-		chairLocationID, chair.ID, req.Latitude, req.Longitude,
+		`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
+		ulid.Make().String(), chair.ID, req.Latitude, req.Longitude, recordedAt,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	trace.stage("get_location")
-	location := &ChairLocation{}
-	if err := tx.GetContext(ctx, location, `SELECT * FROM chair_locations WHERE id = ?`, chairLocationID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	trace.stage("get_latest_ride")
 	ride := &Ride{}
 	statusChanged := false
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
+	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 	} else {
-		trace.fields["ride_id"] = ride.ID
-		trace.stage("get_latest_status")
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
+		status, err := getLatestRideStatus(ctx, db, ride.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		trace.fields["ride_status"] = status
-		trace.stage("check_coordinates")
 		if status != "COMPLETED" && status != "CANCELED" {
 			if req.Latitude == ride.PickupLatitude && req.Longitude == ride.PickupLongitude && status == "ENROUTE" {
-				trace.stage("insert_pickup_status")
-				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "PICKUP"); err != nil {
+				if _, err := db.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "PICKUP"); err != nil {
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
@@ -165,8 +144,7 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
-				trace.stage("insert_arrived_status")
-				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "ARRIVED"); err != nil {
+				if _, err := db.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "ARRIVED"); err != nil {
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
@@ -175,20 +153,12 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	trace.stage("commit")
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
 	if statusChanged {
-		trace.stage("notify_ride")
 		notifyRide(ride.UserID, chair.ID)
 	}
 
-	trace.fields["status_changed"] = statusChanged
-	trace.stage("write_response")
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
-		RecordedAt: location.CreatedAt.UnixMilli(),
+		RecordedAt: recordedAt.UnixMilli(),
 	})
 }
 
