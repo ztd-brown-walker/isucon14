@@ -630,11 +630,6 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type appGetNotificationResponse struct {
-	Data         *appGetNotificationResponseData `json:"data"`
-	RetryAfterMs int                             `json:"retry_after_ms"`
-}
-
 type appGetNotificationResponseData struct {
 	RideID                string                           `json:"ride_id"`
 	PickupCoordinate      Coordinate                       `json:"pickup_coordinate"`
@@ -662,81 +657,79 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
+	serveNotificationSSE(ctx, w, func(force bool) (bool, error) {
+		return sendAppNotification(ctx, w, user, force)
+	})
+}
 
+// ユーザーの最新のライドに未通知の状態があれば、古いものから1件送る。
+// force のときは、未通知の状態がなくても最新の状態を送る。送ったかどうかを返す
+func sendAppNotification(ctx context.Context, w http.ResponseWriter, user *User, force bool) (bool, error) {
 	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
+	if err := db.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
-				RetryAfterMs: 30,
-			})
-			return
+			return false, nil
 		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return false, err
 	}
 
 	yetSentRideStatus := RideStatus{}
 	status := ""
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+	if err := db.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+		if !force {
+			return false, nil
+		}
+		status, err = getLatestRideStatus(ctx, db, ride.ID)
+		if err != nil {
+			return false, err
 		}
 	} else {
 		status = yetSentRideStatus.Status
 	}
 
+	// 運賃と椅子の統計は、送るものがあるときだけ計算する
+	tx, err := db.Beginx()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
 	fare, err := calculateDiscountedFare(ctx, tx, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return false, err
 	}
 
-	response := &appGetNotificationResponse{
-		Data: &appGetNotificationResponseData{
-			RideID: ride.ID,
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Fare:      fare,
-			Status:    status,
-			CreatedAt: ride.CreatedAt.UnixMilli(),
-			UpdateAt:  ride.UpdatedAt.UnixMilli(),
+	data := &appGetNotificationResponseData{
+		RideID: ride.ID,
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
 		},
-		RetryAfterMs: 30,
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Fare:      fare,
+		Status:    status,
+		CreatedAt: ride.CreatedAt.UnixMilli(),
+		UpdateAt:  ride.UpdatedAt.UnixMilli(),
 	}
 
 	if ride.ChairID.Valid {
 		chair := &Chair{}
 		if err := tx.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return false, err
 		}
 
 		stats, err := getChairStats(ctx, tx, chair.ID)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return false, err
 		}
 
-		response.Data.Chair = &appGetNotificationResponseChair{
+		data.Chair = &appGetNotificationResponseChair{
 			ID:    chair.ID,
 			Name:  chair.Name,
 			Model: chair.Model,
@@ -745,19 +738,19 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		if _, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID); err != nil {
+			return false, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return false, err
 	}
 
-	writeJSON(w, http.StatusOK, response)
+	if err := writeSSE(w, data); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {
