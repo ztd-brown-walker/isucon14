@@ -58,6 +58,10 @@ func setup() http.Handler {
 	dbConfig.Net = "tcp"
 	dbConfig.DBName = dbname
 	dbConfig.ParseTime = true
+	// Why not サーバー側の prepared statement のまま: DB が isu2 に移り、Prepare と
+	// Close stmt の往復がクエリごとに乗る。2026-10-25 19:13 の計測ではこの 2 つが
+	// 各 114,090 回で、スロークエリログ全 390,355 文の 58% を占めていた
+	dbConfig.InterpolateParams = true
 
 	_db, err := sqlx.Connect("mysql", dbConfig.FormatDSN())
 	if err != nil {
