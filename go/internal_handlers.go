@@ -48,6 +48,7 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	notifyRide(ride.UserID, matched.ID)
 
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -129,6 +129,7 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ride := &Ride{}
+	statusChanged := false
 	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, err)
@@ -146,6 +147,7 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				statusChanged = true
 			}
 
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
@@ -153,6 +155,7 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				statusChanged = true
 			}
 		}
 	}
@@ -160,6 +163,9 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if statusChanged {
+		notifyRide(ride.UserID, chair.ID)
 	}
 
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
@@ -184,7 +190,10 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
 
-	serveNotificationSSE(ctx, w, func(force bool) (bool, error) {
+	wake, unsubscribe := chairNotifier.subscribe(chair.ID)
+	defer unsubscribe()
+
+	serveNotificationSSE(ctx, w, wake, func(force bool) (bool, error) {
 		return sendChairNotification(ctx, w, chair, force)
 	})
 }
@@ -317,6 +326,7 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	notifyRide(ride.UserID, chair.ID)
 
 	w.WriteHeader(http.StatusNoContent)
 }
